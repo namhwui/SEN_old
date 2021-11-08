@@ -1,72 +1,105 @@
 # EM steps for SEN
 
 
-SEN_major <- function(param, alpha = 0.5, eps = 1e-4) {
+SEN_major <- function(param, eps = 1e-4) {
   x <- param$gamma
   A <- 1 / (2 * sqrt(x^2 + eps))
   W <- 1 / (2 * sqrt(rowSums(x^2) + eps))
   
   SP1 <- t(A * x)
-  SP2 <- t(apply(x, 1, W - max(W), "*"))
+  SP2 <- t(sweep(x, 1, W - max(W), "*"))
   
-  alpha*SP1 + (1 - alpha)*SP2
+  param$alpha*SP1 + (1 - param$alpha)*SP2
 }
 
-FA_btS <- function(param, wt) {
-  temp <- param$lambda %*% t(param$lambda)
-  diag(temp) <- diag(temp) + param$psi
-  beta <- t(param$lambda) %*% solve(temp)
+SEN_update <- function(data, param, wt) {
+  S      <- cov.wt(data, wt = wt, method = "ML")$cov
+  invpsi <- 1/param$psi
+  beta   <- with(param, {t(lambda) %*% solve(sigma)})
   
-  S <- cov.wt(param$data, wt = param$wt, method = "ML")$cov
-  
-  theta <- -beta %*% param$lambda + beta %*% S %*% t(beta)
+  theta       <- -beta %*% param$lambda + beta %*% S %*% t(beta)
   diag(theta) <- diag(theta) + 1
   
-  list(beta = beta, S = S, theta = theta)
+  M <- sweep(t(param$gamma), 2, invpsi, "*") %*% param$gamma
+  N <- diag(beta %*% sweep(S, 2, invpsi, "*") %*% param$gamma)
+  param$xi <- c(solve(theta * M) %*% N)
+  
+  A     <- sweep(beta, 1, param$xi, "*") %*% sweep(S, 2, invpsi, "*")
+  B     <- sweep(sweep(theta, 2, param$xi, "*"), 1, param$xi, "*")
+  mat   <- A - B %*% t(param$gamma) %*% diag(invpsi - max(invpsi))
+  major <- SEN_major(param)
+  
+  param$gamma  <- with(svd(mat - param$rho * major), v %*% t(u))
+  param$lambda <- sweep(param$gamma, 2, param$xi, "*")
+  
+  param$psi         <- diag(S - 2*S%*%t(param$lambda%*%beta) + param$lambda%*%theta%*%t(param$lambda))
+  param$sigma       <- tcrossprod(param$lambda)
+  diag(param$sigma) <- diag(param$sigma) + param$psi
+  
+  param$mu <- colSums(sweep(data, 1, wt, "*")) / sum(wt)
+  
+  param
 }
 
-FA_midstep <- function(param, btS) {
-  beta <- btS$beta
-  S <- btS$S
-  theta <- btS$theta
-  
-  A <- sweep(beta %*% S, 2, 1/param$psi, "*") * param$xi
-  B <- sweep(theta, 2, param$xi, "*") * param$xi
-  M <- t(sweep(param$gamma, 1, 1/param$psi, "*")) %*% param$gamma
-  N <- as.matrix(diag(sweep(beta %*% S, 2, 1/param$psi) %*% param$gamma))
-  
-  FA_major <- A - 0.5 * t(apply(param$gamma %*% B, 1, 1/param$psi - min(param$psi), "*"))
-  
-  list(FA_major = FA_major, A = A, B = B, M = M, N = N, beta = beta, S = S, theta = theta)
-}
 
-
-
-Mstep_SEN <- function(model) {
+Mstep <- function(model) {
   
   wt <- model$wt
   model$prop <- colSums(wt) / nrow(model$data)
-  for (g in 1:model$G) {
-    btS <- FA_btS(model$param[[g]], wt[, g])
-    mid <- FA_midstep(model$param[[g]], btS)
-    SEN <- SEN_major(param[[g]], model$alpha[g])
-    
-    param$mu <- colSums(sweep(model$data, 1, wt[, g], "*")) / sum(wt[, g])
-    param$psi <- diag(mid$S - 2 * mid$S %*% t(mid$beta) %*% param$lambda + param$lambda %*% mid$theta %*% t(param$lambda))
-    param$xi <- solve(mid$theta * mid$M) %*% mid$N
-    param$gamma <- with(svd(FA_major - model$rho[g] * SEN), v %*% t(u))
-    param$lambda <- sweep(param$gamma, 2, param$xi, "*")
-    param$sigma <- tcrossprod(param$lambda)
-    diag(param$sigma) <- diag(param$sigma) + param$psi
+  for (g in 1:ncol(wt)) {
+    model$param[[g]] <- SEN_update(data, model$param[[g]], wt[, g])
   }
   
   model
 }
 
-Estep_SEN <- function(model) {
-  comp_dens <- sapply(1:model$G, function(g) {
-    model$prop[g] * Rfast::rmvnorm(model$data, model$param[[g]]$mu, model$param[[g]]$sigma)
+
+
+Estep <- function(model, logl.only = F) {
+  comp_dens <- sapply(1:ncol(model$wt), function(g) {
+    model$prop[g] * Rfast::dmvnorm(model$data, model$param[[g]]$mu, model$param[[g]]$sigma)
+    #print(cbind(model$param[[g]]$mu, colMeans(model$data[model$label == g, ])))
   })
-  model$wt <- comp_dens / rowSums(comp_dens)
-  model
+  #print(comp_dens)
+  if (logl.only) {
+    return(sum(log(rowSums(comp_dens))))
+  } else {
+    comp_dens / rowSums(comp_dens)
+  }
+}
+
+init_param <- function(q, alpha, rho) {
+  function(data, wt) {
+    G <- ncol(wt)
+    q <- rep(q, G)
+    alpha <- rep(alpha, G)
+    rho <- rep(rho, G)
+    #print(q)
+    
+    lapply(1:ncol(wt), function(g) {
+      mu <- colSums(sweep(data, 1, wt[, g], "*")) / sum(wt[, g])
+      
+      s0    <- cov.wt(data, wt[, g], method = "ML")$cov
+      svd_s <- svd(s0, nu = q[g], nv = 0)
+      #print(svd_s)
+      gamma  <- svd_s$u
+      xi     <- sqrt(svd_s$d[1:q[g]])
+      #print(xi)
+      lambda <- sweep(gamma, 2, xi, "*")
+      psi    <- abs(diag(s0 - lambda %*% t(lambda)))
+      
+      sigma       <- lambda %*% t(lambda)
+      diag(sigma) <- diag(sigma) + psi
+      
+      list(mu     = mu,
+           gamma  = gamma,
+           xi     = xi,
+           lambda = lambda,
+           psi    = psi,
+           sigma  = sigma,
+           alpha  = alpha[g],
+           rho    = rho[g])
+    })
+    
+  }
 }
