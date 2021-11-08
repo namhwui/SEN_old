@@ -35,6 +35,14 @@ criterion_BIC <- function(model) {
 }
 
 
+EM_label <- function(model) {
+  wt <- model$wt
+  if (ncol(wt) == 1) return(rep(1, nrow(wt)))
+  
+  sapply(1:nrow(wt), function(ii) {
+    which.max(wt[ii, ])
+  })
+}
 
 
 EM_control <- function(init_label, criterion, convergence, iter = NULL, iter_max = 500) {
@@ -72,8 +80,7 @@ EM_until_converge <- function(model, Estep, Mstep, control) {
   
   model$logl      <- model$logl[1:min(model$ii, iter_max)]
   model$criterion <- criterion(model)
-  #model$converged <- convergence(model)
-  #remove(model$ii)
+  model$label     <- EM_label(model)
   model
 }
 
@@ -91,6 +98,7 @@ EM_fixed_iter <- function(model, Estep, Mstep, control) {
   
   model$logl <- logl
   model$criterion <- control$criterion(model)
+  model$label     <- EM_label(model)
   model
 }
 
